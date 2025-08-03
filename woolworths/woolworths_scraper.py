@@ -8,8 +8,8 @@ import argparse
 from pyppeteer import launch
     
 # Import utility modules
-from db_utils import SupabaseClient
-from product_processor import ProductProcessor
+from shared.db_utils import SupabaseClient
+from .product_processor import ProductProcessor
 
 # Set up logging
 logging.basicConfig(

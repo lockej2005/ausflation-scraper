@@ -1,15 +1,16 @@
-# Woolworths Product Scraper
+# Supermarket Product Scrapers
 
-A Python web scraper for collecting product data from Woolworths online store, with comparison capabilities for Coles products.
+A Python web scraping suite for collecting product data from Australian supermarket websites (Woolworths and Coles) for price comparison and consumer research.
 
 ## Features
 
-- Scrapes product information from multiple Woolworths categories
+- **Woolworths Scraper**: Comprehensive product data collection from all categories
+- **Coles Scraper**: Product data collection with comparison capabilities
+- **Shared Utilities**: Common database, duplicate detection, and analysis tools
 - Removes duplicate products within and across categories
 - Supports headless and non-headless browser modes
 - Optional integration with Supabase for data storage
 - Generates detailed reports and statistics
-- Includes Coles product comparison functionality
 
 ## Installation
 
@@ -26,41 +27,58 @@ export SUPABASE_KEY="your_supabase_key"
 
 ## Usage
 
-### Basic scraping (all categories):
+### Woolworths Scraper
+
 ```bash
-python woolworths_scraper.py
+# Basic scraping (all categories)
+python -m woolworths.woolworths_scraper
+
+# Scraping specific categories
+python -m woolworths.woolworths_scraper --categories fruit-veg,bakery
+
+# With Supabase upload
+python -m woolworths.woolworths_scraper --upload
+
+# Limit pages per category
+python -m woolworths.woolworths_scraper --max-pages 5
 ```
 
-### Scraping specific categories:
-```bash
-python woolworths_scraper.py --categories fruit-veg,bakery
-```
+### Coles Scraper
 
-### With Supabase upload:
 ```bash
-python woolworths_scraper.py --upload
-```
+# Basic scraping
+python -m coles.coles_scraper
 
-### Limit pages per category:
-```bash
-python woolworths_scraper.py --max-pages 5
+# With upload
+python -m coles.coles_scraper --upload
 ```
 
 ## Output
 
-- Product data saved as JSON files in `woolworths_data/` directory
+- Product data saved as JSON files in respective `*_data/` directories
 - Summary reports with statistics
 - Duplicate analysis reports
 - Cross-category duplicate detection
 
 ## Project Structure
 
-- `woolworths_scraper.py` - Main scraper script
-- `product_processor.py` - Product data processing utilities
-- `db_utils.py` - Database integration utilities
-- `coles/` - Coles comparison functionality
-- `woolworths_data/` - Output directory (ignored by git)
+```
+├── woolworths/           # Woolworths-specific scraping
+│   ├── woolworths_scraper.py
+│   └── product_processor.py
+├── coles/               # Coles-specific scraping
+│   ├── coles_scraper.py
+│   └── coles_product_processor.py
+├── shared/              # Shared utilities
+│   ├── db_utils.py      # Database integration
+│   ├── count_products.py
+│   ├── duplicates.py
+│   └── find_duplicate_products.py
+├── woolworths_data/     # Woolworths output (ignored by git)
+├── coles/coles_data/    # Coles output (ignored by git)
+└── improvements.md      # Development notes
+```
 
 ## Notes
 
-This tool is intended for price comparison and consumer research purposes.
+This tool is intended for price comparison and consumer research purposes only.

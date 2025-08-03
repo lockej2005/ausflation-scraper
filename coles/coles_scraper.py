@@ -9,9 +9,9 @@ from pyppeteer import launch
 import re
 
 # Import utility modules
-from db_utils import SupabaseClient
+from shared.db_utils import SupabaseClient
 # Import the modified ProductProcessor class
-from coles_product_processor import ColesProductProcessor
+from .coles_product_processor import ColesProductProcessor
 
 # Set up logging
 logging.basicConfig(
