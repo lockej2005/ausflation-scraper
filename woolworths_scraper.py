@@ -1,0 +1,668 @@
+import asyncio
+import logging
+import os
+import json
+import time
+from datetime import datetime
+import argparse
+from pyppeteer import launch
+    
+# Import utility modules
+from db_utils import SupabaseClient
+from product_processor import ProductProcessor
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger("WoolworthsScraper")
+
+# Array of Woolworths category URLs to scrape
+CATEGORY_URLS = [
+    "https://www.woolworths.com.au/shop/browse/fruit-veg",
+    "https://www.woolworths.com.au/shop/browse/poultry-meat-seafood",
+    "https://www.woolworths.com.au/shop/browse/deli-chilled-meals",
+    "https://www.woolworths.com.au/shop/browse/dairy-eggs-fridge",
+    "https://www.woolworths.com.au/shop/browse/bakery",
+    "https://www.woolworths.com.au/shop/browse/lunch-box",
+    "https://www.woolworths.com.au/shop/browse/freezer",
+    "https://www.woolworths.com.au/shop/browse/snacks-confectionery",
+    "https://www.woolworths.com.au/shop/browse/pantry",
+    "https://www.woolworths.com.au/shop/browse/international-foods",
+    "https://www.woolworths.com.au/shop/browse/drinks",
+    "https://www.woolworths.com.au/shop/browse/beer-wine-spirits",
+    "https://www.woolworths.com.au/shop/browse/beauty",
+    "https://www.woolworths.com.au/shop/browse/personal-care",
+    "https://www.woolworths.com.au/shop/browse/health-wellness",
+    "https://www.woolworths.com.au/shop/browse/cleaning-maintenance",
+    "https://www.woolworths.com.au/shop/browse/baby",
+    "https://www.woolworths.com.au/shop/browse/pet",
+    "https://www.woolworths.com.au/shop/browse/home-lifestyle",
+    "https://www.woolworths.com.au/shop/browse/electronics",
+    "https://www.woolworths.com.au/shop/browse/sports-fitness-outdoor-activities"
+]
+
+def find_chrome_path():
+    """Find Chrome or Edge installation on the system"""
+    possible_paths = []
+    
+    if os.name == 'nt':  # Windows
+        possible_paths = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"
+        ]
+    
+    for path in possible_paths:
+        if os.path.exists(path):
+            logger.info(f"Found browser at: {path}")
+            return path
+    
+    logger.warning("No Chrome or Edge installation found")
+    return None
+
+async def get_total_pages(page):
+    """Extract the total number of pages from the page indicator element"""
+    try:
+        total_pages = await page.evaluate('''
+            () => {
+                // Look for the page indicator element
+                const pageIndicator = document.querySelector('.page-indicator');
+                if (pageIndicator) {
+                    // Find the page count span
+                    const pageCountElement = pageIndicator.querySelector('.page-count');
+                    if (pageCountElement) {
+                        // Extract the number
+                        const pageCount = parseInt(pageCountElement.textContent.trim(), 10);
+                        if (!isNaN(pageCount)) {
+                            return pageCount;
+                        }
+                    }
+                }
+                return null;
+            }
+        ''')
+        
+        if total_pages:
+            logger.info(f"Found total pages: {total_pages}")
+            return total_pages
+    except Exception as e:
+        logger.warning(f"Could not extract total pages: {e}")
+    
+    # If we couldn't find the page indicator, fall back to a default
+    return None
+
+async def scrape_products_from_page(page, category_name, total_products_count=None, products_found_so_far=0):
+    """Extract products from the current page, including ALL products regardless of section"""
+    
+    # First, try to get the total products count if not provided
+    if total_products_count is None:
+        try:
+            total_products_count = await page.evaluate('''
+                () => {
+                    const recordCountElement = document.querySelector('wow-record-count');
+                    if (recordCountElement) {
+                        const text = recordCountElement.textContent || '';
+                        // Extract the total count which usually appears as "X of YYY Products"
+                        const match = text.match(/of\\s+(\\d+)\\s+Products/i);
+                        if (match && match[1]) {
+                            return parseInt(match[1], 10);
+                        }
+                    }
+                    return null;
+                }
+            ''')
+            if total_products_count:
+                logger.info(f"Found total products count: {total_products_count}")
+        except Exception as e:
+            logger.warning(f"Could not extract total products count: {e}")
+    
+    # Extract all products from the page, including trending and promotional sections
+    products = await page.evaluate('''
+        (categoryName) => {
+            const products = [];
+            
+            // Check if the "no products" message is present
+            const bodyText = document.body.innerText;
+            if (bodyText.includes("There are no products matching your filters") ||
+                bodyText.includes("No products found") ||
+                bodyText.includes("no results")) {
+                return "NO_PRODUCTS";
+            }
+            
+            // Find all product tiles
+            const productElements = document.querySelectorAll('wc-product-tile');
+            
+            console.log(`Found ${productElements.length} product elements on this page`);
+            
+            // If no products found, check if we're at the end
+            if (productElements.length === 0) {
+                return "NO_PRODUCTS";
+            }
+            
+            // Process each product element
+            productElements.forEach((element, index) => {
+                try {
+                    // Access the shadow DOM
+                    const shadowRoot = element.shadowRoot;
+                    
+                    if (!shadowRoot) {
+                        console.log(`No shadow root for element ${index}`);
+                        products.push({
+                            title: `Product ${index + 1}`,
+                            price_value: 0,
+                            unit_price: "",
+                            category: categoryName
+                        });
+                        return;
+                    }
+                    
+                    // Look for title
+                    let title = "Unknown Product";
+                    const titleElement = shadowRoot.querySelector('.title a');
+                    if (titleElement) {
+                        title = titleElement.textContent.trim();
+                    }
+                    
+                    // Look for price
+                    let priceValue = 0;
+                    const priceElement = shadowRoot.querySelector('.primary');
+                    if (priceElement) {
+                        const priceText = priceElement.textContent.trim();
+                        // Extract numeric value (remove $ and convert to number)
+                        const priceMatch = priceText.match(/\\$?([\d\.]+)/);
+                        if (priceMatch && priceMatch[1]) {
+                            priceValue = parseFloat(priceMatch[1]);
+                        }
+                    }
+                    
+                    // Look for unit price
+                    let unitPrice = "";
+                    const unitPriceElement = shadowRoot.querySelector('.price-per-cup');
+                    if (unitPriceElement) {
+                        unitPrice = unitPriceElement.textContent.trim();
+                    }
+                    
+                    // Look for was price (original price)
+                    let wasPriceValue = 0;
+                    const wasPriceElement = shadowRoot.querySelector('.was-price');
+                    if (wasPriceElement) {
+                        const wasPriceText = wasPriceElement.textContent.trim();
+                        // Extract numeric value
+                        const wasPriceMatch = wasPriceText.match(/\\$?([\d\.]+)/);
+                        if (wasPriceMatch && wasPriceMatch[1]) {
+                            wasPriceValue = parseFloat(wasPriceMatch[1]);
+                        }
+                    }
+                    
+                    // Look for savings amount
+                    let saveValue = 0;
+                    const saveElement = shadowRoot.querySelector('.save-price');
+                    if (saveElement) {
+                        const saveText = saveElement.textContent.trim();
+                        // Extract numeric value
+                        const saveMatch = saveText.match(/\\$?([\d\.]+)/);
+                        if (saveMatch && saveMatch[1]) {
+                            saveValue = parseFloat(saveMatch[1]);
+                        }
+                    }
+                    
+                    // Get the product URL if available
+                    let productUrl = "";
+                    const linkElement = shadowRoot.querySelector('.title a');
+                    if (linkElement && linkElement.href) {
+                        productUrl = linkElement.href;
+                    }
+                    
+                    // Try to extract product ID from URL
+                    let productId = "";
+                    if (productUrl) {
+                        const urlParts = productUrl.split('/');
+                        if (urlParts.length > 0) {
+                            productId = urlParts[urlParts.length - 2] || "";
+                        }
+                    }
+                    
+                    // Get product image URL
+                    let imageUrl = "";
+                    const imageElement = shadowRoot.querySelector('.product-tile-image img');
+                    if (imageElement && imageElement.src) {
+                        imageUrl = imageElement.src;
+                    }
+                    
+                    // Add to products array
+                    products.push({
+                        id: productId,
+                        title: title,
+                        price_value: priceValue,
+                        was_price_value: wasPriceValue,
+                        save_value: saveValue,
+                        unit_price: unitPrice,
+                        url: productUrl,
+                        image_url: imageUrl,
+                        category: categoryName,
+                        scrapedAt: new Date().toISOString()
+                    });
+                } catch (error) {
+                    console.error(`Error processing product ${index}:`, error);
+                    products.push({
+                        title: `Product ${index + 1}`,
+                        price_value: 0,
+                        unit_price: "",
+                        category: categoryName
+                    });
+                }
+            });
+            
+            // Debug and log section information
+            console.log(`Attempting to process the scraping request. Found ${products.length} products.`);
+            
+            // Identify which section we're in to help with debugging
+            let sectionInfo = "Unknown section";
+            const pageText = document.body.innerText;
+            if (pageText.includes("Displaying") && pageText.includes("of") && pageText.includes("Products")) {
+                sectionInfo = "Main product listing (All Products)";
+            } else if (pageText.includes("Trending")) {
+                sectionInfo = "Trending section";
+            } else if (pageText.includes("Top Picks") || pageText.includes("Most Popular")) {
+                sectionInfo = "Promotional section";
+            }
+            
+            console.log(`Section identified: ${sectionInfo}`);
+            
+            return {
+                products: products,
+                section: sectionInfo
+            };
+        }
+    ''', category_name)
+    
+    # Check if we've reached the end of products
+    if products == "NO_PRODUCTS":
+        return "NO_PRODUCTS"
+    
+    return products
+
+async def scrape_category(browser, url, max_pages=None):
+    """Scrape all products from a category, handling pagination"""
+    logger.info(f"Scraping category: {url}")
+    
+    # Get category name from URL
+    category_name = url.split('/')[-1].split('?')[0]
+    logger.info(f"Category name: {category_name}")
+    
+    all_products = []
+    total_products_count = None
+    
+    try:
+        # Open new page
+        page = await browser.newPage()
+        
+        # Set a realistic user agent
+        await page.setUserAgent(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/91.0.4472.124 Safari/537.36"
+        )
+        
+        # Navigate to the first page to get total pages
+        first_page_url = f"{url.split('?')[0]}?pageNumber=1"
+        logger.info(f"Loading first page to determine total pages: {first_page_url}")
+        
+        try:
+            await page.goto(first_page_url, {"waitUntil": "networkidle0", "timeout": 60000})
+            await asyncio.sleep(3)  # Wait for page to load
+        except Exception as e:
+            logger.error(f"Error navigating to {first_page_url}: {e}")
+            try:
+                logger.info(f"Retrying first page")
+                await page.goto(first_page_url, {"waitUntil": "networkidle0", "timeout": 90000})
+                await asyncio.sleep(5)  # Wait longer for retry
+            except Exception as e2:
+                logger.error(f"Error on retry: {e2}")
+                return []
+        
+        # Get total pages from the page indicator
+        total_pages = await get_total_pages(page)
+        
+        if not total_pages:
+            logger.warning("Could not determine total pages, will use product count as fallback")
+        else:
+            logger.info(f"Will scrape {total_pages} pages for category {category_name}")
+            
+            # If max_pages is set, use the smaller of the two
+            if max_pages and max_pages < total_pages:
+                total_pages = max_pages
+                logger.info(f"Limiting to {max_pages} pages as specified")
+        
+        # For each page, scrape products
+        for page_num in range(1, (total_pages or 100) + 1):  # Use 100 as fallback if total_pages is None
+            # Navigate to the page
+            page_url = f"{url.split('?')[0]}?pageNumber={page_num}"
+            logger.info(f"Loading page {page_num}: {page_url}")
+            
+            try:
+                await page.goto(page_url, {"waitUntil": "networkidle0", "timeout": 60000})
+                await asyncio.sleep(3)  # Wait for page to load
+            except Exception as e:
+                logger.error(f"Error navigating to {page_url}: {e}")
+                    
+                # Try once more
+                try:
+                    logger.info(f"Retrying page {page_num}")
+                    await page.goto(page_url, {"waitUntil": "networkidle0", "timeout": 90000})
+                    await asyncio.sleep(5)  # Wait longer for retry
+                except Exception as e2:
+                    logger.error(f"Error on retry: {e2}")
+                    break
+            
+            # Extract products from the current page
+            logger.info(f"Extracting products from page {page_num}")
+            result = await scrape_products_from_page(page, category_name, total_products_count, len(all_products))
+            
+            if result == "NO_PRODUCTS":
+                logger.info(f"Reached end of products at page {page_num}")
+                break
+                
+            # Handle different result formats
+            if isinstance(result, dict):
+                page_products = result.get('products', [])
+                section_info = result.get('section', 'Unknown section')
+                logger.info(f"Section identified: {section_info}")
+            elif isinstance(result, tuple) and len(result) >= 2:
+                page_products = result[0]
+                total_products_count = result[1]
+            else:
+                page_products = result
+            
+            if not page_products or len(page_products) == 0:
+                logger.warning(f"No products found on page {page_num}")
+                continue  # Try the next page instead of breaking
+            
+            logger.info(f"Found {len(page_products)} products on page {page_num}")
+            
+            # Check if any new products were added
+            products_before = len(all_products)
+            
+            # Add page number to each product
+            for product in page_products:
+                product['page'] = page_num
+            
+            all_products.extend(page_products)
+            products_after = len(all_products)
+            new_products_added = products_after - products_before
+            
+            logger.info(f"Added {new_products_added} products from page {page_num} (total: {len(all_products)})")
+            
+            # Wait between pages to avoid being blocked
+            if page_num < (total_pages or 100):
+                await asyncio.sleep(2)
+                
+            # If we've reached the last page based on page indicator, stop
+            if total_pages and page_num >= total_pages:
+                logger.info(f"Reached the last page ({page_num} of {total_pages})")
+                break
+        
+        logger.info(f"Completed scraping {total_pages or page_num} pages for {category_name}")
+        logger.info(f"Total products found for {category_name}: {len(all_products)}")
+        
+        # Close the page
+        await page.close()
+        
+        return all_products
+        
+    except Exception as e:
+        logger.error(f"Error scraping category {category_name}: {e}")
+        return []
+
+async def main():
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Woolworths Multi-Category Scraper')
+    parser.add_argument('--max-pages', type=int, help='Maximum pages to scrape per category', default=None)
+    parser.add_argument('--headless', action='store_true', help='Run browser in headless mode', default=True)
+    parser.add_argument('--upload', action='store_true', help='Upload data to Supabase', default=False)
+    parser.add_argument('--categories', type=str, help='Comma-separated list of categories to scrape (e.g. fruit-veg,bakery)', default=None)
+    args = parser.parse_args()
+    
+    print("=" * 50)
+    print("WOOLWORTHS MULTI-CATEGORY SCRAPER")
+    print("=" * 50)
+    
+    # Create output directory for results
+    output_dir = "woolworths_data"
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Create a timestamp for this scraping run
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Create a summary file
+    summary_filename = os.path.join(output_dir, f"summary_{timestamp}.txt")
+    with open(summary_filename, 'w', encoding='utf-8') as f:
+        f.write(f"Woolworths Scraping Run - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Categories to scrape: {len(CATEGORY_URLS)}\n\n")
+    
+    # Initialize the product processor
+    processor = ProductProcessor()
+    
+    # Initialize Supabase client if uploading
+    supabase = None
+    if args.upload:
+        try:
+            # Get Supabase credentials from environment variables
+            supabase_url = os.getenv('SUPABASE_URL')
+            supabase_key = os.getenv('SUPABASE_KEY')
+            
+            if not supabase_url or not supabase_key:
+                logger.error("SUPABASE_URL and SUPABASE_KEY environment variables must be set for upload")
+                logger.warning("Continuing without Supabase upload capability")
+                args.upload = False
+            else:
+                supabase = SupabaseClient(url=supabase_url, key=supabase_key)
+            logger.info("Initialized Supabase client")
+        except Exception as e:
+            logger.error(f"Error initializing Supabase: {e}")
+            logger.warning("Continuing without Supabase upload capability")
+    
+    # Track overall statistics
+    total_products = 0
+    successful_categories = 0
+    all_category_products = {}  # Store products for cross-category duplicate analysis
+    
+    # Filter categories if specified
+    if args.categories:
+        category_filters = args.categories.lower().split(',')
+        filtered_urls = [url for url in CATEGORY_URLS if any(filter_name in url.lower() for filter_name in category_filters)]
+        if filtered_urls:
+            logger.info(f"Filtered to {len(filtered_urls)} categories: {args.categories}")
+            category_urls = filtered_urls
+        else:
+            logger.warning(f"No categories matched filter: {args.categories}. Using all categories.")
+            category_urls = CATEGORY_URLS
+    else:
+        category_urls = CATEGORY_URLS
+    
+    # Find Chrome or Edge path
+    chrome_path = find_chrome_path()
+    
+    # Launch browser with specific executable path
+    launch_options = {
+        'headless': args.headless,
+        'args': [
+            '--no-sandbox', 
+            '--disable-dev-shm-usage',
+            '--disable-gpu',
+            '--window-size=1920,1080'
+        ],
+    }
+    
+    if chrome_path:
+        launch_options['executablePath'] = chrome_path
+    
+    browser = await launch(**launch_options)
+    
+    try:
+        # Scrape each category
+        for i, category_url in enumerate(category_urls, 1):
+            category_name = category_url.split('/')[-1].split('?')[0]
+            
+            print(f"\n[{i}/{len(category_urls)}] Scraping category: {category_name}")
+            
+            # Scrape products for this category
+            products = await scrape_category(browser, category_url, args.max_pages)
+            
+            # Skip if no products found
+            if not products:
+                logger.warning(f"No products found for category: {category_name}")
+                continue
+            
+            # Process products to ensure consistent format
+            processed_products = processor.process_products(products)
+            
+            # Remove duplicates
+            unique_products, duplicate_products = processor.remove_duplicates(processed_products)
+            
+            # Store for cross-category analysis
+            all_category_products[category_name] = unique_products
+            
+            # Get duplicate report
+            duplicate_report = processor.generate_duplicate_report(duplicate_products, category_name, timestamp)
+            
+            # Write duplicate report to file
+            duplicate_report_file = os.path.join(output_dir, f"duplicates_{category_name}_{timestamp}.txt")
+            with open(duplicate_report_file, 'w', encoding='utf-8') as f:
+                f.write(duplicate_report)
+            
+            successful_categories += 1
+            total_products += len(unique_products)
+            
+            # Get stats
+            duplicates_removed = processor.product_stats.get('duplicates_removed', 0)
+            expected_count = products[0].get('expected_count', 0) if products else 0
+            
+            # Create metadata
+            metadata = {
+                "category": category_name,
+                "url": category_url,
+                "timestamp": datetime.now().isoformat(),
+                "expected_products": expected_count,
+                "actual_products": len(unique_products),
+                "duplicates_removed": duplicates_removed,
+                "pages_scraped": max(product.get('page', 1) for product in unique_products) if unique_products else 0
+            }
+            
+            # Create output data structure
+            output_data = {
+                "metadata": metadata,
+                "products": unique_products
+            }
+            
+            # Create filename with timestamp and category name
+            filename = os.path.join(output_dir, f"woolworths_{category_name}_{timestamp}.json")
+            
+            # Save to JSON file
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(output_data, f, indent=2)
+            
+            print(f"Found {len(unique_products)} products for {category_name}")
+            print(f"Removed {duplicates_removed} duplicates")
+            print(f"Saved to {filename}")
+            
+            # Update summary file
+            with open(summary_filename, 'a', encoding='utf-8') as f:
+                f.write(f"{category_name}: {len(unique_products)} products")
+                if expected_count:
+                    f.write(f", expected: {expected_count} ({(len(unique_products)/expected_count*100):.1f}%)")
+                f.write(f", duplicates removed: {duplicates_removed}")
+                f.write("\n")
+            
+            # Upload to Supabase if enabled
+            if args.upload and supabase:
+                try:
+                    # First, get existing product to determine if this is new or an update
+                    existing_products = supabase.get_existing_product_ids(category_name)
+                    new_products = [p for p in unique_products if p['id'] not in existing_products]
+                    updated_products = [p for p in unique_products if p['id'] in existing_products]
+                    
+                    if new_products:
+                        logger.info(f"Uploading {len(new_products)} new products to Supabase")
+                        supabase.upload_products(new_products, category_name)
+                    
+                    if updated_products:
+                        logger.info(f"Updating {len(updated_products)} existing products in Supabase")
+                        supabase.upload_products(updated_products, category_name)
+                    
+                    # Upload category stats
+                    supabase.upload_category_stats(category_name, metadata)
+                    logger.info(f"Uploaded {len(new_products)} new and {len(updated_products)} updated products to Supabase")
+                except Exception as e:
+                    logger.error(f"Error uploading to Supabase: {e}")
+            
+            # Wait between categories to avoid being blocked
+            if i < len(category_urls):
+                wait_time = 5  # 5 seconds between categories
+                print(f"Waiting {wait_time} seconds before next category...")
+                await asyncio.sleep(wait_time)
+    
+    finally:
+        await browser.close()
+        logger.info("Browser closed")
+    
+    # Find cross-category duplicates
+    cross_duplicates = processor.find_cross_category_duplicates(all_category_products)
+    
+    # Generate cross-category duplicate report
+    cross_dup_report_file = os.path.join(output_dir, f"cross_category_duplicates_{timestamp}.txt")
+    with open(cross_dup_report_file, 'w', encoding='utf-8') as f:
+        f.write(f"Cross-Category Duplicates Report\n")
+        f.write(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        f.write(f"Found {len(cross_duplicates)} products appearing in multiple categories\n\n")
+        
+        for i, (product_id, products) in enumerate(cross_duplicates.items(), 1):
+            categories = set()
+            titles = set()
+            
+            for category, product in products:
+                categories.add(category)
+                titles.add(product.get('title', 'Unknown'))
+            
+            # Use the first title found
+            title = next(iter(titles)) if titles else 'Unknown'
+            
+            f.write(f"{i}. ID: {product_id} - {title}\n")
+            f.write(f"   Found in {len(categories)} categories: {', '.join(sorted(categories))}\n\n")
+    
+    # Update summary with final statistics
+    with open(summary_filename, 'a', encoding='utf-8') as f:
+        f.write(f"\nSummary:\n")
+        f.write(f"Total categories scraped successfully: {successful_categories}/{len(category_urls)}\n")
+        f.write(f"Total products found: {total_products}\n")
+        f.write(f"Products appearing in multiple categories: {len(cross_duplicates)}\n")
+        f.write(f"Scraping completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    
+    # Upload overall scraping run statistics to Supabase
+    if args.upload and supabase:
+        try:
+            run_data = {
+                'run_timestamp': datetime.strptime(timestamp, "%Y%m%d_%H%M%S").isoformat(),
+                'categories_attempted': len(category_urls),
+                'categories_successful': successful_categories,
+                'total_products': total_products,
+                'cross_category_duplicates': len(cross_duplicates)
+            }
+            supabase.upload_scraping_run(run_data)
+        except Exception as e:
+            logger.error(f"Error uploading scraping run statistics: {e}")
+    
+    print("\n" + "=" * 50)
+    print(f"SCRAPING COMPLETE")
+    print(f"Total categories: {len(category_urls)}")
+    print(f"Successful categories: {successful_categories}")
+    print(f"Total products found: {total_products}")
+    print(f"Products appearing in multiple categories: {len(cross_duplicates)}")
+    print(f"Summary saved to: {summary_filename}")
+    print("=" * 50)
+
+if __name__ == "__main__":
+    asyncio.run(main())
