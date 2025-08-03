@@ -7,6 +7,10 @@ from datetime import datetime
 import argparse
 from pyppeteer import launch
 import re
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Import utility modules
 from shared.db_utils import SupabaseClient
@@ -494,11 +498,8 @@ async def main():
     supabase = None
     if args.upload:
         try:
-            # Pass Supabase credentials directly
-            supabase = SupabaseClient(
-                url="https://qtjqhzznexlukdrncdbo.supabase.co",
-                key="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InF0anFoenpuZXhsdWtkcm5jZGJvIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc0MzMxNTk4OCwiZXhwIjoyMDU4ODkxOTg4fQ.9ktTLfAkaNM6j1ESz0zSZcoTzGJua1QKPAn41Bnw7DE"
-            )
+            # Use environment variables for credentials
+            supabase = SupabaseClient()
             logger.info("Initialized Supabase client")
         except Exception as e:
             logger.error(f"Error initializing Supabase: {e}")

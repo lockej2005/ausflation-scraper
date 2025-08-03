@@ -11,8 +11,8 @@ class SupabaseClient:
     
     def __init__(self, url=None, key=None):
         """Initialize the Supabase client with credentials"""
-        self.url = url or os.environ.get("SUPABASE_URL")
-        self.key = key or os.environ.get("SUPABASE_KEY")
+        self.url = url or os.environ.get("NEXT_PUBLIC_SUPABASE_URL")
+        self.key = key or os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
         
         if not self.url or not self.key:
             raise ValueError("Supabase URL and key must be provided via parameters or environment variables")
